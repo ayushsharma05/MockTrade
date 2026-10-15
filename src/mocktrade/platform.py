@@ -38,6 +38,8 @@ from mocktrade.risk.loss_watch import DailyLossWatch
 from mocktrade.risk.throttle import OrderThrottle
 from mocktrade.store.events import EventLog
 
+ALGO_ENDS = ("DONE", "STOPPED", "FAILED", "LOST")  # audit kinds ALGO_<end>: no longer running
+
 
 @dataclass
 class AccountRuntime:
@@ -85,6 +87,31 @@ class Platform:
                 loops.append(runtime.reconciler.run())
         await asyncio.gather(*loops)
 
+    def lost_protection(self, account_id: str) -> list[str]:
+        """At start: protection algos (stops held by MockTrade) that were running when the
+        server last stopped. They don't survive a restart, so each is named, in words, for
+        an alert; and noted as lost in the audit, so it is reported once."""
+        if self.event_log is None:
+            return []
+        log = self.event_log
+        open_: dict[str, dict] = {}
+        for e in log.notes(account_id, [f"ALGO_{k}" for k in ALGO_ENDS + ("STARTED",)]):
+            algo_id = e.extra.get("algo_id", "")
+            if e.kind == "ALGO_STARTED":
+                if e.extra.get("family") == "protection":
+                    open_[algo_id] = e.extra
+            else:
+                open_.pop(algo_id, None)
+        lost = []
+        for algo_id, a in open_.items():
+            words = (
+                f"{a.get('code')} {a.get('side')} {a.get('qty')} {a.get('instrument_id')} "
+                f"({algo_id}, {a.get('user_id')})"
+            )
+            lost.append(words)
+            log.record_note("ALGO_LOST", account_id, f"not running after a restart: {words}", a)
+        return lost
+
     @staticmethod
     async def _run_algos(runtime: AccountRuntime) -> None:
         """Algos don't survive a restart: cancel their leftover children, then run."""
@@ -129,6 +156,7 @@ class Platform:
             return None
 
         audit = None
+        family = {t.spec.code: t.spec.family for t in types}
         if self.event_log is not None:
             log = self.event_log
 
@@ -141,6 +169,7 @@ class Platform:
                     {
                         "algo_id": a.algo_id,
                         "code": a.code,
+                        "family": family.get(a.code, ""),
                         "instrument_id": a.instrument_id,
                         "side": a.side.value,
                         "qty": a.qty,

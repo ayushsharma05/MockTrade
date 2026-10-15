@@ -123,7 +123,7 @@ class BaseStrategy:
 
     def done(self, ctx: "AlgoContext") -> bool:
         """Finished when the main leg is fully filled (a spread also waits for its hedge)."""
-        return ctx.filled(ctx.instrument_id) >= ctx.qty
+        return ctx.filled(ctx.instrument_id, ctx.side) >= ctx.qty
 
     def keep_on_stop(self, ctx: "AlgoContext", child: OrderView) -> bool:
         """Children to leave working on pause/stop (a spread keeps its hedges)."""
@@ -181,6 +181,12 @@ class _Parent:
     in_flight_qty: int = 0  # their quantity on the main leg (counts against the parent)
 
 
+def _main(p: "_Parent", request: OrderRequest) -> bool:
+    """On the main leg: the parent's instrument, on the parent's side. (A bracket's exits are
+    on the same instrument but the other side; they don't count toward the parent.)"""
+    return request.instrument_id == p.instrument_id and request.side is p.side
+
+
 class AlgoContext:
     """What a strategy can see and do. Every order goes through the order manager."""
 
@@ -224,28 +230,34 @@ class AlgoContext:
     def working(self) -> list[OrderView]:
         return [c for c in self.children() if not c.status.is_final]
 
-    def filled(self, instrument_id: str | None = None) -> int:
-        """Quantity filled so far (on one leg if given, signed by nothing: always positive)."""
+    def filled(self, instrument_id: str | None = None, side: Side | None = None) -> int:
+        """Quantity filled so far, on one leg and/or one side if given (always positive)."""
         return sum(
             c.filled_qty
             for c in self.children()
-            if instrument_id is None or c.request.instrument_id == instrument_id
+            if (instrument_id is None or c.request.instrument_id == instrument_id)
+            and (side is None or c.request.side is side)
         )
 
-    def average_price(self, instrument_id: str | None = None) -> int | None:
-        """Average fill price on a leg (the main one by default), or None before any fill."""
+    def average_price(
+        self, instrument_id: str | None = None, side: Side | None = None
+    ) -> int | None:
+        """Average fill price on a leg and side (the main leg and the parent's side by
+        default), or None before any fill."""
         leg = instrument_id or self._parent.instrument_id
+        side = side or self._parent.side
         fills = [(c.filled_qty, c.avg_price_paise) for c in self.children()
-                 if c.request.instrument_id == leg and c.filled_qty]  # fmt: skip
+                 if c.request.instrument_id == leg and c.request.side is side
+                 and c.filled_qty]  # fmt: skip
         qty = sum(q for q, _ in fills)
         return round(sum(q * p for q, p in fills) / qty) if qty else None
 
     def remaining(self) -> int:
-        """Main leg: parent quantity not yet filled and not working."""
-        main = self._parent.instrument_id
-        working = sum(c.leaves_qty for c in self.working() if c.request.instrument_id == main)
-        sent = self._parent.in_flight_qty  # sent a moment ago, not registered yet
-        return max(0, self._parent.qty - self.filled(main) - working - sent)
+        """Main leg (the parent's instrument and side): quantity not yet filled nor working."""
+        p = self._parent
+        working = sum(c.leaves_qty for c in self.working() if _main(p, c.request))
+        sent = p.in_flight_qty  # sent a moment ago, not registered yet
+        return max(0, p.qty - self.filled(p.instrument_id, p.side) - working - sent)
 
     @property
     def sending(self) -> int:
@@ -278,7 +290,8 @@ class AlgoContext:
         if not hedge and (p.state is not AlgoState.WORKING or self.held):
             return False  # hedges (risk-reducing) still go out while paused or stopping
         leg = instrument_id or p.instrument_id
-        if check_remaining and leg == p.instrument_id and qty > self.remaining():
+        main = leg == p.instrument_id and (side or p.side) is p.side
+        if check_remaining and main and qty > self.remaining():
             return False
         request = OrderRequest(
             client_order_id="",
@@ -298,7 +311,7 @@ class AlgoContext:
             parent_id=p.algo_id,
         )
         p.in_flight += 1
-        if leg == p.instrument_id:
+        if main:
             p.in_flight_qty += qty
         self._engine.spawn(self._engine.manager.submit(request))
         return True
@@ -633,7 +646,7 @@ class AlgoEngine:
         if event.kind is EventKind.SUBMITTED and order.client_order_id not in p.children:
             p.children.append(order.client_order_id)
             p.in_flight = max(0, p.in_flight - 1)
-            if order.request.instrument_id == p.instrument_id:
+            if _main(p, order.request):
                 p.in_flight_qty = max(0, p.in_flight_qty - order.request.qty)
             if p.state is not AlgoState.WORKING:
                 # sent just before a pause or stop: pull it straight away
@@ -683,12 +696,10 @@ class AlgoEngine:
             return False
 
     def _main_filled(self, p: _Parent) -> int:
-        return sum(
-            c.filled_qty for c in self.children(p) if c.request.instrument_id == p.instrument_id
-        )
+        return sum(c.filled_qty for c in self.children(p) if _main(p, c.request))
 
     def _view(self, p: _Parent) -> AlgoView:
-        main = [c for c in self.children(p) if c.request.instrument_id == p.instrument_id]
+        main = [c for c in self.children(p) if _main(p, c.request)]
         filled = sum(c.filled_qty for c in main)
         value = sum(c.filled_qty * c.avg_price_paise for c in main)
         return AlgoView(

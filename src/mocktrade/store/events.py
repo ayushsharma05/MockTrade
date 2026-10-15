@@ -279,6 +279,14 @@ class EventLog:
             args = (after_seq, account_id)
         return self._query(sql, (*args, limit))
 
+    def notes(self, account_id: str, kinds: list[str]) -> list[StoredEvent]:
+        """One account's notes of these kinds, oldest first (e.g. algo starts and ends)."""
+        if not kinds:
+            return []
+        marks = ",".join("?" * len(kinds))
+        sql = f"SELECT * FROM events WHERE account_id = ? AND kind IN ({marks}) ORDER BY seq"
+        return self._query(sql, (account_id, *kinds))
+
     def page(
         self,
         names: list[str],
